@@ -40,6 +40,15 @@ class LocationData(BaseModel):
 class LocationRequest(BaseModel):
     locations: List[LocationData]
 
+class FarmLocation(BaseModel):
+    latitude: str
+    longitude: str
+
+class FarmLocationResponse(BaseModel):
+    latitude: str
+    longitude: str
+    isDuplicate: bool
+
 class SimilarPair(BaseModel):
     pairId: str
     imageId1: str
@@ -461,6 +470,41 @@ async def get_statistics():
             "remove_first_keep_second": keep_second
         }
     }
+
+@app.post("/save-farm-data", response_model=List[FarmLocationResponse])
+async def save_farm_data(locations: List[FarmLocation]):
+    try:
+        logger.info(f"Processing {len(locations)} farm locations")
+        
+        response_data = []
+        seen_locations = set()
+        
+        for location in locations:
+            # Create a unique key for each location
+            location_key = f"{location.latitude}_{location.longitude}"
+            
+            # Check if this location is a duplicate
+            is_duplicate = location_key in seen_locations
+            
+            # Add to seen locations
+            seen_locations.add(location_key)
+            
+            # Create response object
+            response_data.append(
+                FarmLocationResponse(
+                    latitude=location.latitude,
+                    longitude=location.longitude,
+                    isDuplicate=is_duplicate
+                )
+            )
+        
+        logger.info(f"Processed {len(response_data)} locations")
+        return response_data
+        
+    except Exception as e:
+        logger.error(f"Error processing farm data: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error processing farm data: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
