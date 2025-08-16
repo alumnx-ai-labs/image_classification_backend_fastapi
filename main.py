@@ -1,25 +1,25 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List
 import random
 import uuid
 from datetime import datetime
-import math
-import tensorflow as tf
-from PIL import Image
-import numpy as np
-import io
-import base64
 import logging
-import traceback
+from pymongo import MongoClient
 import os
+from dotenv import load_dotenv
+from bson import ObjectId
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Mango Tree Location API", version="1.0.0")
+
+#Setting up connection with the database
+load_dotenv()
+connection_string = os.getenv('MONGODB_URI')
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -39,6 +39,15 @@ class LocationData(BaseModel):
 
 class LocationRequest(BaseModel):
     locations: List[LocationData]
+
+class FarmLocation(BaseModel):
+    latitude: str
+    longitude: str
+
+class FarmLocationResponse(BaseModel):
+    latitude: str
+    longitude: str
+    isDuplicate: bool
 
 class SimilarPair(BaseModel):
     pairId: str
@@ -64,68 +73,9 @@ class DecisionResponse(BaseModel):
     message: str
     saved_to_database: bool
 
-class ImageClassificationRequest(BaseModel):
-    image_data: str  # base64 encoded image
-    model_type: str  # 'teachable_machine' or 'mobilenet'
-
-class ClassificationResult(BaseModel):
-    className: str
-    probability: float
-
-class ImageClassificationResponse(BaseModel):
-    predictions: List[ClassificationResult]
-    model_used: str
-
 # Global variables
-mobilenet_model = None
-MOBILENET_CLASSES = ['mango_tree', 'not_mango_tree']  # Adjust according to your model
 processed_locations = []
 decisions_log = []
-
-# Load the fine-tuned model with detailed error handling
-def load_mobilenet_model():
-    global mobilenet_model
-    try:
-        model_path = 'mango_model-v001.h5'
-        logger.info(f"Attempting to load model from: {model_path}")
-        
-        # Check if file exists
-        if not os.path.exists(model_path):
-            logger.error(f"Model file not found at: {model_path}")
-            logger.info(f"Current working directory: {os.getcwd()}")
-            logger.info(f"Files in current directory: {os.listdir('.')}")
-            return False
-        
-        # Check file size
-        file_size = os.path.getsize(model_path)
-        logger.info(f"Model file size: {file_size} bytes")
-        
-        # Load model
-        mobilenet_model = tf.keras.models.load_model(model_path)
-        logger.info("MobileNetV2 model loaded successfully")
-        
-        # Log model information
-        logger.info(f"Model input shape: {mobilenet_model.input_shape}")
-        logger.info(f"Model output shape: {mobilenet_model.output_shape}")
-        logger.info(f"Number of layers: {len(mobilenet_model.layers)}")
-        
-        # Test model with dummy input
-        dummy_input = np.random.random((1, 224, 224, 3))
-        test_prediction = mobilenet_model.predict(dummy_input)
-        logger.info(f"Test prediction shape: {test_prediction.shape}")
-        logger.info(f"Test prediction values: {test_prediction}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error loading MobileNetV2 model: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        mobilenet_model = None
-        return False
-
-# Initialize model on startup
-model_loaded = load_mobilenet_model()
-logger.info(f"Model initialization result: {model_loaded}")
 
 def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """
@@ -171,132 +121,61 @@ def find_nearby_pairs(locations: List[LocationData], threshold_meters: float = 1
     
     return pairs
 
-def preprocess_image_for_mobilenet(image_data: str) -> np.ndarray:
-    """
-    Preprocess base64 image data for MobileNetV2 model.
-    """
-    try:
-        logger.info("Starting image preprocessing")
-        logger.info(f"Image data length: {len(image_data)}")
-        
-        # Decode base64 image
-        if ',' in image_data:
-            header, encoded = image_data.split(',', 1)
-            logger.info(f"Image header: {header}")
-            image_bytes = base64.b64decode(encoded)
-        else:
-            image_bytes = base64.b64decode(image_data)
-        
-        logger.info(f"Decoded image bytes length: {len(image_bytes)}")
-        
-        # Open image
-        image = Image.open(io.BytesIO(image_bytes))
-        logger.info(f"Original image size: {image.size}")
-        logger.info(f"Original image mode: {image.mode}")
-        
-        # Convert to RGB if necessary
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-            logger.info("Converted image to RGB")
-        
-        # Resize to MobileNetV2 input size (224x224)
-        image = image.resize((224, 224))
-        logger.info(f"Resized image to: {image.size}")
-        
-        # Convert to numpy array and normalize
-        image_array = np.array(image)
-        logger.info(f"Image array shape before normalization: {image_array.shape}")
-        logger.info(f"Image array dtype: {image_array.dtype}")
-        logger.info(f"Image array min/max values: {image_array.min()}/{image_array.max()}")
-        
-        # Normalize to [0, 1]
-        image_array = image_array.astype(np.float32) / 255.0
-        logger.info(f"Image array min/max after normalization: {image_array.min()}/{image_array.max()}")
-        
-        # Add batch dimension
-        image_array = np.expand_dims(image_array, axis=0)
-        logger.info(f"Final image array shape: {image_array.shape}")
-        
-        return image_array
-        
-    except Exception as e:
-        logger.error(f"Error in image preprocessing: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+#Helper function for ObjectId serialization
+def serialize_doc(doc):
+    """Convert MongoDB document to JSON-serializable format"""
+    if isinstance(doc, list):
+        return [serialize_doc(item) for item in doc]
+    if isinstance(doc, dict):
+        return {key: serialize_doc(value) for key, value in doc.items()}
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    return doc
 
-def classify_with_mobilenet(image_array: np.ndarray) -> List[ClassificationResult]:
-    """
-    Classify image using the fine-tuned MobileNetV2 model.
-    """
+# Retrieving Farm data from the database
+def get_farm_data():
+    client = None
     try:
-        logger.info("Starting MobileNet classification")
-        
-        if mobilenet_model is None:
-            logger.error("MobileNetV2 model is not loaded")
-            raise HTTPException(status_code=500, detail="MobileNetV2 model not loaded")
-        
-        logger.info(f"Input array shape: {image_array.shape}")
-        logger.info(f"Input array dtype: {image_array.dtype}")
-        
-        # Make prediction
-        logger.info("Making prediction...")
-        predictions = mobilenet_model.predict(image_array, verbose=0)
-        logger.info(f"Raw predictions shape: {predictions.shape}")
-        logger.info(f"Raw predictions: {predictions}")
-        
-        # Convert predictions to result format
-        results = []
-        for i, prob in enumerate(predictions[0]):
-            className = MOBILENET_CLASSES[i] if i < len(MOBILENET_CLASSES) else f"class_{i}"
-            result = ClassificationResult(
-                className=className,
-                probability=float(prob)
-            )
-            results.append(result)
-            logger.info(f"Class {className}: {float(prob):.4f}")
-        
-        # Sort by probability (highest first)
-        results.sort(key=lambda x: x.probability, reverse=True)
-        
-        logger.info("Classification completed successfully")
-        return results
-        
+        client = MongoClient(connection_string)
+        client.admin.command('ping')
+
+        try:
+            db = client['agriculture']
+
+            try:
+                farm_collection = db['farm']
+
+                try:
+                    # Fetch all documents and serialize them
+                    documents = list(farm_collection.find())
+                    client.close()
+                    return serialize_doc(documents)
+
+                except Exception as e:
+                    client.close()
+                    return {"error": f"document access error: {str(e)}"}
+
+            except Exception as e:
+                client.close()
+                return {"error": f"Collection access error: {str(e)}"}
+
+        except Exception as e:
+            client.close()
+            return {"error": f"Database access error: {str(e)}"}        
+
     except Exception as e:
-        logger.error(f"Error in MobileNet classification: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+        return {"error": f"Database server connection error: {str(e)}"}
+
+
+
+
 
 @app.get("/")
 async def root():
     """Health check endpoint"""
     return {
         "message": "Mango Tree Location API is running", 
-        "timestamp": datetime.now(),
-        "model_loaded": mobilenet_model is not None,
-        "tensorflow_version": tf.__version__
-    }
-
-@app.get("/model-status")
-async def model_status():
-    """Get detailed model status"""
-    return {
-        "model_loaded": mobilenet_model is not None,
-        "model_classes": MOBILENET_CLASSES,
-        "tensorflow_version": tf.__version__,
-        "model_input_shape": mobilenet_model.input_shape if mobilenet_model else None,
-        "model_output_shape": mobilenet_model.output_shape if mobilenet_model else None,
-        "current_directory": os.getcwd(),
-        "model_file_exists": os.path.exists('mango_model-v001.h5')
-    }
-
-@app.post("/reload-model")
-async def reload_model():
-    """Reload the MobileNet model"""
-    success = load_mobilenet_model()
-    return {
-        "success": success,
-        "model_loaded": mobilenet_model is not None,
-        "message": "Model reloaded successfully" if success else "Failed to reload model"
+        "timestamp": datetime.now()
     }
 
 @app.post("/check-proximity", response_model=ProximityResponse)
@@ -325,7 +204,6 @@ async def check_proximity(request: LocationRequest):
         
     except Exception as e:
         logger.error(f"Error in check_proximity: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error processing locations: {str(e)}")
 
 @app.post("/save-decision", response_model=DecisionResponse)
@@ -358,47 +236,7 @@ async def save_decision(request: DecisionRequest):
         
     except Exception as e:
         logger.error(f"Error in save_decision: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Error saving decision: {str(e)}")
-
-@app.post("/classify-image", response_model=ImageClassificationResponse)
-async def classify_image(request: ImageClassificationRequest):
-    """
-    Classify image using either Teachable Machine or MobileNetV2 model.
-    """
-    try:
-        logger.info(f"Classification request received with model type: {request.model_type}")
-        
-        if request.model_type == 'mobilenet':
-            logger.info("Processing with MobileNetV2 model")
-            
-            # Use MobileNetV2 model
-            image_array = preprocess_image_for_mobilenet(request.image_data)
-            predictions = classify_with_mobilenet(image_array)
-            
-            response = ImageClassificationResponse(
-                predictions=predictions,
-                model_used='mobilenet'
-            )
-            
-            logger.info(f"Classification successful, returning {len(predictions)} predictions")
-            return response
-            
-        else:
-            # Return error for teachable machine as it should be handled on frontend
-            logger.warning(f"Invalid model type requested: {request.model_type}")
-            raise HTTPException(
-                status_code=400, 
-                detail="Teachable Machine classification should be handled on frontend"
-            )
-            
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except Exception as e:
-        logger.error(f"Error in classify_image: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error classifying image: {str(e)}")
 
 @app.get("/decisions")
 async def get_decisions():
@@ -461,6 +299,55 @@ async def get_statistics():
             "remove_first_keep_second": keep_second
         }
     }
+
+# This code has been written by Lokesh
+@app.post("/save-farm-data", response_model=List[FarmLocationResponse])
+async def save_farm_data(locations: List[FarmLocation]):
+    try:
+        logger.info(f"Processing {len(locations)} farm locations")
+        
+        response_data = []
+        seen_locations = set()
+        
+        for location in locations:
+            # Create a unique key for each location
+            location_key = f"{location.latitude}_{location.longitude}"
+            
+            # Check if this location is a duplicate
+            is_duplicate = location_key in seen_locations
+            
+            # Add to seen locations
+            seen_locations.add(location_key)
+            
+            # Create response object
+            response_data.append(
+                FarmLocationResponse(
+                    latitude=location.latitude,
+                    longitude=location.longitude,
+                    isDuplicate=is_duplicate
+                )
+            )
+        
+        logger.info(f"Processed {len(response_data)} locations")
+        return response_data
+        
+    except Exception as e:
+        logger.error(f"Error processing farm data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing farm data: {str(e)}")
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """
+    Return Data to Dispay on Dashboard.
+    """
+
+    farm_data = get_farm_data()
+
+    if farm_data:
+        return (farm_data)
+    else:
+        return("could not get farm data")
 
 if __name__ == "__main__":
     import uvicorn
