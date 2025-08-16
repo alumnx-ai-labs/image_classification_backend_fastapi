@@ -6,12 +6,20 @@ import random
 import uuid
 from datetime import datetime
 import logging
+from pymongo import MongoClient
+import os
+from dotenv import load_dotenv
+from bson import ObjectId
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Mango Tree Location API", version="1.0.0")
+
+#Setting up connection with the database
+load_dotenv()
+connection_string = os.getenv('MONGODB_URI')
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -112,6 +120,55 @@ def find_nearby_pairs(locations: List[LocationData], threshold_meters: float = 1
             pairs.append(pair)
     
     return pairs
+
+#Helper function for ObjectId serialization
+def serialize_doc(doc):
+    """Convert MongoDB document to JSON-serializable format"""
+    if isinstance(doc, list):
+        return [serialize_doc(item) for item in doc]
+    if isinstance(doc, dict):
+        return {key: serialize_doc(value) for key, value in doc.items()}
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    return doc
+
+# Retrieving Farm data from the database
+def get_farm_data():
+    client = None
+    try:
+        client = MongoClient(connection_string)
+        client.admin.command('ping')
+
+        try:
+            db = client['agriculture']
+
+            try:
+                farm_collection = db['farm']
+
+                try:
+                    # Fetch all documents and serialize them
+                    documents = list(farm_collection.find())
+                    client.close()
+                    return serialize_doc(documents)
+
+                except Exception as e:
+                    client.close()
+                    return {"error": f"document access error: {str(e)}"}
+
+            except Exception as e:
+                client.close()
+                return {"error": f"Collection access error: {str(e)}"}
+
+        except Exception as e:
+            client.close()
+            return {"error": f"Database access error: {str(e)}"}        
+
+    except Exception as e:
+        return {"error": f"Database server connection error: {str(e)}"}
+
+
+
+
 
 @app.get("/")
 async def root():
@@ -277,6 +334,20 @@ async def save_farm_data(locations: List[FarmLocation]):
     except Exception as e:
         logger.error(f"Error processing farm data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing farm data: {str(e)}")
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """
+    Return Data to Dispay on Dashboard.
+    """
+
+    farm_data = get_farm_data()
+
+    if farm_data:
+        return (farm_data)
+    else:
+        return("could not get farm data")
 
 if __name__ == "__main__":
     import uvicorn
