@@ -1,17 +1,25 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import random
 import uuid
 from datetime import datetime
 import logging
+from pymongo import MongoClient
+import os
+from dotenv import load_dotenv
+from bson import ObjectId
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Mango Tree Location API", version="1.0.0")
+
+#Setting up connection with the database
+load_dotenv()
+connection_string = os.getenv('MONGODB_URI')
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -29,17 +37,29 @@ class LocationData(BaseModel):
     longitude: float
     imageId: str
 
+class PlantLocation(BaseModel):
+    cropType: str = "mango"  # Default to mango, but can be specified
+    latitude: str
+    longitude: str
+
+
 class LocationRequest(BaseModel):
     locations: List[LocationData]
 
-class FarmLocation(BaseModel):
+class FarmLocationInput(BaseModel):
     latitude: str
     longitude: str
+    farmId: str  # Mandatory farm _id
+    cropType: Optional[str] = "mango"  # Optional crop type, defaults to mango
 
 class FarmLocationResponse(BaseModel):
     latitude: str
     longitude: str
+    cropType: str
+    farmId: str
     isDuplicate: bool
+    saved: bool
+    message: str
 
 class SimilarPair(BaseModel):
     pairId: str
@@ -112,6 +132,128 @@ def find_nearby_pairs(locations: List[LocationData], threshold_meters: float = 1
             pairs.append(pair)
     
     return pairs
+
+#Helper function for ObjectId serialization
+def serialize_doc(doc):
+    """Convert MongoDB document to JSON-serializable format"""
+    if isinstance(doc, list):
+        return [serialize_doc(item) for item in doc]
+    if isinstance(doc, dict):
+        return {key: serialize_doc(value) for key, value in doc.items()}
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    return doc
+
+# Retrieving Farm data from the database
+def get_farm_data():
+    client = None
+    try:
+        client = MongoClient(connection_string)
+        client.admin.command('ping')
+
+        try:
+            db = client['agriculture']
+
+            try:
+                farm_collection = db['farm']
+
+                try:
+                    # Fetch all documents and serialize them
+                    documents = list(farm_collection.find())
+                    client.close()
+                    return serialize_doc(documents)
+
+                except Exception as e:
+                    client.close()
+                    return {"error": f"document access error: {str(e)}"}
+
+            except Exception as e:
+                client.close()
+                return {"error": f"Collection access error: {str(e)}"}
+
+        except Exception as e:
+            client.close()
+            return {"error": f"Database access error: {str(e)}"}        
+
+    except Exception as e:
+        return {"error": f"Database server connection error: {str(e)}"}
+
+# Helper function to save single plant data to MongoDB
+def save_plant_to_farm(latitude: str, longitude: str, farm_id: str, crop_type: str = "mango"):
+    """Save single plant to existing farm after checking for duplicates"""
+    client = None
+    try:
+        client = MongoClient(connection_string)
+        client.admin.command('ping')
+        
+        db = client['agriculture']
+        farm_collection = db['farm']
+        
+        # Convert farmId string to ObjectId
+        from bson import ObjectId
+        farm_object_id = ObjectId(farm_id)
+        
+        # Check if farm exists
+        existing_farm = farm_collection.find_one({"_id": farm_object_id})
+        
+        if not existing_farm:
+            client.close()
+            return {
+                "success": False,
+                "isDuplicate": False,
+                "message": f"Farm with ID {farm_id} not found"
+            }
+        
+        # Check for duplicate coordinates in existing plants
+        existing_plants = existing_farm.get("plants", [])
+        for plant in existing_plants:
+            if plant.get("latitude") == latitude and plant.get("longitude") == longitude:
+                client.close()
+                return {
+                    "success": False,
+                    "isDuplicate": True,
+                    "message": "Plant with same coordinates already exists in this farm"
+                }
+        
+        # No duplicate found, add new plant
+        new_plant = {
+            "cropType": crop_type,
+            "latitude": latitude,
+            "longitude": longitude
+        }
+        
+        # Add plant to the farm's plants array
+        result = farm_collection.update_one(
+            {"_id": farm_object_id},
+            {"$push": {"plants": new_plant}}
+        )
+        
+        client.close()
+        
+        if result.modified_count > 0:
+            return {
+                "success": True,
+                "isDuplicate": False,
+                "message": f"Plant added successfully to farm {farm_id}"
+            }
+        else:
+            return {
+                "success": False,
+                "isDuplicate": False,
+                "message": "Failed to add plant to farm"
+            }
+        
+    except Exception as e:
+        if client:
+            client.close()
+        return {
+            "success": False,
+            "isDuplicate": False,
+            "message": f"Database error: {str(e)}"
+        }
+
+
+
 
 @app.get("/")
 async def root():
@@ -243,40 +385,69 @@ async def get_statistics():
         }
     }
 
-# This code has been written by Lokesh
-@app.post("/save-farm-data", response_model=List[FarmLocationResponse])
-async def save_farm_data(locations: List[FarmLocation]):
+@app.post("/save-farm-data", response_model=FarmLocationResponse)
+async def save_farm_data(location: FarmLocationInput):
     try:
-        logger.info(f"Processing {len(locations)} farm locations")
+        logger.info(f"Processing plant data for farm {location.farmId}")
         
-        response_data = []
-        seen_locations = set()
-        
-        for location in locations:
-            # Create a unique key for each location
-            location_key = f"{location.latitude}_{location.longitude}"
-            
-            # Check if this location is a duplicate
-            is_duplicate = location_key in seen_locations
-            
-            # Add to seen locations
-            seen_locations.add(location_key)
-            
-            # Create response object
-            response_data.append(
-                FarmLocationResponse(
-                    latitude=location.latitude,
-                    longitude=location.longitude,
-                    isDuplicate=is_duplicate
-                )
+        # Validate farmId format (should be a valid ObjectId)
+        try:
+            from bson import ObjectId
+            ObjectId(location.farmId)  # This will raise an exception if invalid
+        except Exception as e:
+            logger.error(f"Invalid farmId {location.farmId}: {str(e)}")
+            return FarmLocationResponse(
+                latitude=location.latitude,
+                longitude=location.longitude,
+                cropType=location.cropType or "mango",
+                farmId=location.farmId,
+                isDuplicate=False,
+                saved=False,
+                message=f"Invalid farmId format: {str(e)}"
             )
         
-        logger.info(f"Processed {len(response_data)} locations")
-        return response_data
+        # Save to database
+        save_result = save_plant_to_farm(
+            location.latitude, 
+            location.longitude, 
+            location.farmId,
+            location.cropType or "mango"
+        )
+        
+        if save_result["success"]:
+            logger.info(f"Successfully saved plant to farm {location.farmId}")
+        else:
+            logger.warning(f"Failed to save plant to farm {location.farmId}: {save_result['message']}")
+        
+        # Create response
+        return FarmLocationResponse(
+            latitude=location.latitude,
+            longitude=location.longitude,
+            cropType=location.cropType or "mango",
+            farmId=location.farmId,
+            isDuplicate=save_result["isDuplicate"],
+            saved=save_result["success"],
+            message=save_result["message"]
+        )
         
     except Exception as e:
-        logger.error(f"Error processing farm data: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing farm data: {str(e)}")
+        logger.error(f"Error processing plant data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing plant data: {str(e)}")
+
+
+
+@app.get("/dashboard")
+async def dashboard():
+    """
+    Return Data to Dispay on Dashboard.
+    """
+
+    farm_data = get_farm_data()
+
+    if farm_data:
+        return (farm_data)
+    else:
+        return("could not get farm data")
 
 if __name__ == "__main__":
     import uvicorn
