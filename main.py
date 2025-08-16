@@ -471,6 +471,7 @@ async def get_statistics():
         }
     }
 
+# This code has been written by Lokesh
 @app.post("/save-farm-data", response_model=List[FarmLocationResponse])
 async def save_farm_data(locations: List[FarmLocation]):
     try:
