@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import random
 import uuid
 from datetime import datetime
@@ -10,6 +10,10 @@ from pymongo import MongoClient
 import os
 from dotenv import load_dotenv
 from bson import ObjectId
+import cloudinary
+import cloudinary.utils
+import time
+import hashlib
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +32,14 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Configure Cloudinary
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
 )
 
 # Pydantic models
@@ -84,6 +96,25 @@ class DecisionResponse(BaseModel):
     success: bool
     message: str
     saved_to_database: bool
+
+class SignatureRequest(BaseModel):
+    folder: str = "mango-trees"
+    tags: List[str] = []
+    context: Optional[str] = None
+
+class SignatureResponse(BaseModel):
+    signature: str
+    timestamp: int
+    cloudName: str
+    apiKey: str
+
+class ImageMetadata(BaseModel):
+    cloudinaryUrl: str
+    publicId: str
+    originalName: str
+    predictions: List[Dict[str, Any]]
+    location: Optional[Dict[str, float]] = None
+    uploadedAt: str
 
 # Global variables
 processed_locations = []
@@ -434,8 +465,6 @@ async def save_farm_data(location: FarmLocationInput):
         logger.error(f"Error processing plant data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing plant data: {str(e)}")
 
-
-
 @app.get("/dashboard")
 async def dashboard():
     """
@@ -448,6 +477,98 @@ async def dashboard():
         return (farm_data)
     else:
         return("could not get farm data")
+
+#CLOUDINARY SIGNATURE
+@app.post("/get-cloudinary-signature", response_model=SignatureResponse)
+async def get_cloudinary_signature(request: SignatureRequest):
+    """
+    Generate a signature for secure direct upload to Cloudinary.
+    This allows frontend to upload directly to Cloudinary securely.
+    """
+    try:
+        # Generate timestamp (current time in seconds)
+        timestamp = int(time.time())
+        
+        # Parameters to sign
+        params_to_sign = {
+            "timestamp": timestamp,
+            "folder": request.folder
+        }
+        
+        
+        # Generate the signature using Cloudinary's utility
+        signature = cloudinary.utils.api_sign_request(
+            params_to_sign,
+            os.getenv("CLOUDINARY_API_SECRET")
+        )
+        
+        return SignatureResponse(
+            signature=signature,
+            timestamp=timestamp,
+            cloudName=os.getenv("CLOUDINARY_CLOUD_NAME"),
+            apiKey=os.getenv("CLOUDINARY_API_KEY")
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate upload signature: {str(e)}"
+        )
+
+# SAVE IMAGE METADATA
+# Simple in-memory storage  (replace with actual database)
+image_metadata_store = []
+
+@app.post("/save-image-metadata")
+async def save_image_metadata(metadata: ImageMetadata):
+    """
+    Save image metadata after successful Cloudinary upload.
+    This lightweight endpoint stores only metadata, not the actual image.
+    """
+    try:
+        # Create metadata record
+        record = {
+            "id": str(uuid.uuid4()),
+            "cloudinary_url": metadata.cloudinaryUrl,
+            "public_id": metadata.publicId,
+            "original_name": metadata.originalName,
+            "predictions": metadata.predictions,
+            "location": metadata.location,
+            "uploaded_at": metadata.uploadedAt,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Check if it's a mango tree (for statistics)
+        is_mango = False
+        if metadata.predictions:
+            top_prediction = max(metadata.predictions, key=lambda x: x.get('probability', 0))
+            if (top_prediction.get('className', '').lower() == 'mango_tree' 
+                and top_prediction.get('probability', 0) > 0.5):
+                is_mango = True
+        
+        record["is_mango_tree"] = is_mango
+        
+        # TODO: Replace this with your MongoDB database save
+        
+        # For now, just store in memory
+        image_metadata_store.append(record)
+
+        logger.info(f"Saved metadata for image: {metadata.originalName}")
+        
+        return {
+            "success": True,
+            "message": "Metadata saved successfully",
+            "record_id": record["id"]
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save metadata: {str(e)}"
+        )
+
+
+
 
 if __name__ == "__main__":
     import uvicorn
