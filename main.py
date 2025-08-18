@@ -1,15 +1,21 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import random
 import uuid
 from datetime import datetime
 import logging
 from pymongo import MongoClient
 import os
+import shutil
 from dotenv import load_dotenv
 from bson import ObjectId
+import cloudinary
+import cloudinary.utils
+import cloudinary.uploader
+import time
+import hashlib
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +36,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Configure Cloudinary
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True
+)
+
 # Pydantic models
 class LocationData(BaseModel):
     imageName: str
@@ -47,6 +61,7 @@ class LocationRequest(BaseModel):
     locations: List[LocationData]
 
 class FarmLocationInput(BaseModel):
+    fileName: str
     latitude: str
     longitude: str
     farmId: str  # Mandatory farm _id
@@ -84,6 +99,38 @@ class DecisionResponse(BaseModel):
     success: bool
     message: str
     saved_to_database: bool
+
+class SignatureRequest(BaseModel):
+    folder: str = "mango-trees"
+    tags: List[str] = []
+    context: Optional[str] = None
+
+class SignatureResponse(BaseModel):
+    signature: str
+    timestamp: int
+    cloudName: str
+    apiKey: str
+
+class ImageMetadata(BaseModel):
+    cloudinaryUrl: str
+    publicId: str
+    originalName: str
+    predictions: List[Dict[str, Any]]
+    location: Optional[Dict[str, float]] = None
+    uploadedAt: str
+
+# class ImageUploadResponse(BaseModel):
+#     success: bool
+#     message: str
+#     cloudinary_url: Optional[str] = None
+#     public_id: Optional[str] = None
+#     secure_url: Optional[str] = None
+
+class ImageUploadResponse(BaseModel):
+    success: bool
+    message: str
+    file_path: Optional[str] = None
+    filename: Optional[str] = None
 
 # Global variables
 processed_locations = []
@@ -179,7 +226,7 @@ def get_farm_data():
         return {"error": f"Database server connection error: {str(e)}"}
 
 # Helper function to save single plant data to MongoDB
-def save_plant_to_farm(latitude: str, longitude: str, farm_id: str, crop_type: str = "mango"):
+def save_plant_to_farm(fileName: str, latitude: str, longitude: str, farm_id: str, crop_type: str = "mango"):
     """Save single plant to existing farm after checking for duplicates"""
     client = None
     try:
@@ -217,6 +264,7 @@ def save_plant_to_farm(latitude: str, longitude: str, farm_id: str, crop_type: s
         
         # No duplicate found, add new plant
         new_plant = {
+            "fileName": fileName,
             "cropType": crop_type,
             "latitude": latitude,
             "longitude": longitude
@@ -397,6 +445,7 @@ async def save_farm_data(location: FarmLocationInput):
         except Exception as e:
             logger.error(f"Invalid farmId {location.farmId}: {str(e)}")
             return FarmLocationResponse(
+                fileName=location.fileName,
                 latitude=location.latitude,
                 longitude=location.longitude,
                 cropType=location.cropType or "mango",
@@ -408,6 +457,7 @@ async def save_farm_data(location: FarmLocationInput):
         
         # Save to database
         save_result = save_plant_to_farm(
+            location.fileName,
             location.latitude, 
             location.longitude, 
             location.farmId,
@@ -434,8 +484,6 @@ async def save_farm_data(location: FarmLocationInput):
         logger.error(f"Error processing plant data: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing plant data: {str(e)}")
 
-
-
 @app.get("/dashboard")
 async def dashboard():
     """
@@ -448,6 +496,185 @@ async def dashboard():
         return (farm_data)
     else:
         return("could not get farm data")
+
+#CLOUDINARY SIGNATURE
+@app.post("/get-cloudinary-signature", response_model=SignatureResponse)
+async def get_cloudinary_signature(request: SignatureRequest):
+    """
+    Generate a signature for secure direct upload to Cloudinary.
+    This allows frontend to upload directly to Cloudinary securely.
+    """
+    try:
+        # Generate timestamp (current time in seconds)
+        timestamp = int(time.time())
+        
+        # Parameters to sign
+        params_to_sign = {
+            "timestamp": timestamp,
+            "folder": request.folder
+        }
+        
+        
+        # Generate the signature using Cloudinary's utility
+        signature = cloudinary.utils.api_sign_request(
+            params_to_sign,
+            os.getenv("CLOUDINARY_API_SECRET")
+        )
+        
+        return SignatureResponse(
+            signature=signature,
+            timestamp=timestamp,
+            cloudName=os.getenv("CLOUDINARY_CLOUD_NAME"),
+            apiKey=os.getenv("CLOUDINARY_API_KEY")
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate upload signature: {str(e)}"
+        )
+
+# SAVE IMAGE METADATA
+# Simple in-memory storage  (replace with actual database)
+image_metadata_store = []
+
+@app.post("/save-image-metadata")
+async def save_image_metadata(metadata: ImageMetadata):
+    """
+    Save image metadata after successful Cloudinary upload.
+    This lightweight endpoint stores only metadata, not the actual image.
+    """
+    try:
+        # Create metadata record
+        record = {
+            "id": str(uuid.uuid4()),
+            "cloudinary_url": metadata.cloudinaryUrl,
+            "public_id": metadata.publicId,
+            "original_name": metadata.originalName,
+            "predictions": metadata.predictions,
+            "location": metadata.location,
+            "uploaded_at": metadata.uploadedAt,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        # Check if it's a mango tree (for statistics)
+        is_mango = False
+        if metadata.predictions:
+            top_prediction = max(metadata.predictions, key=lambda x: x.get('probability', 0))
+            if (top_prediction.get('className', '').lower() == 'mango_tree' 
+                and top_prediction.get('probability', 0) > 0.5):
+                is_mango = True
+        
+        record["is_mango_tree"] = is_mango
+        
+        # TODO: Replace this with your MongoDB database save
+        
+        # For now, just store in memory
+        image_metadata_store.append(record)
+
+        logger.info(f"Saved metadata for image: {metadata.originalName}")
+        
+        return {
+            "success": True,
+            "message": "Metadata saved successfully",
+            "record_id": record["id"]
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save metadata: {str(e)}"
+        )
+
+# @app.post("/save-image", response_model=ImageUploadResponse)
+# async def save_image(file: UploadFile = File(...)):
+#     """
+#     Save image directly to Cloudinary from frontend upload.
+#     """
+#     try:
+#         # Validate file type
+#         if not file.content_type.startswith('image/'):
+#             raise HTTPException(status_code=400, detail="File must be an image")
+        
+#         # Read file content
+#         file_content = await file.read()
+        
+#         # Upload to Cloudinary
+#         upload_result = cloudinary.uploader.upload(
+#             file_content,
+#             folder="mango-trees",
+#             resource_type="image",
+#             public_id=f"img_{int(time.time())}_{file.filename}",
+#             overwrite=True
+#         )
+        
+#         # Save metadata to your store
+#         metadata_record = {
+#             "id": str(uuid.uuid4()),
+#             "cloudinary_url": upload_result.get("url"),
+#             "secure_url": upload_result.get("secure_url"),
+#             "public_id": upload_result.get("public_id"),
+#             "original_name": file.filename,
+#             "uploaded_at": datetime.now().isoformat(),
+#             "file_size": len(file_content),
+#             "format": upload_result.get("format")
+#         }
+        
+#         image_metadata_store.append(metadata_record)
+        
+#         logger.info(f"Successfully saved image: {file.filename}")
+        
+#         return ImageUploadResponse(
+#             success=True,
+#             message="Image saved successfully",
+#             cloudinary_url=upload_result.get("url"),
+#             public_id=upload_result.get("public_id"),
+#             secure_url=upload_result.get("secure_url")
+#         )
+        
+#     except Exception as e:
+#         logger.error(f"Error saving image: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"Failed to save image: {str(e)}")
+
+@app.post("/save-image", response_model=ImageUploadResponse)
+async def save_image(file: UploadFile):
+    """
+    Save image to backend filesystem.
+    """
+    try:
+        # Check if file is provided
+        if not file:
+            raise HTTPException(status_code=400, detail="No file provided")
+            
+        # Validate file type
+        if not file.content_type or not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        # Create uploads directory if it doesn't exist
+        upload_dir = "uploads"
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # Generate unique filename
+        timestamp = int(time.time())
+        filename = f"{timestamp}_{file.filename}"
+        file_path = os.path.join(upload_dir, filename)
+        
+        # Save file to backend
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        logger.info(f"Successfully saved image: {filename}")
+        
+        return ImageUploadResponse(
+            success=True,
+            message="Image saved successfully to backend",
+            file_path=file_path,
+            filename=filename
+        )
+        
+    except Exception as e:
+        logger.error(f"Error saving image: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save image: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
