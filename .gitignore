@@ -16,3 +16,4 @@ build
 *.zip
 *.vscode
 *.pytest_cache
+uploads

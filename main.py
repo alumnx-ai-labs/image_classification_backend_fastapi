@@ -61,6 +61,7 @@ class LocationRequest(BaseModel):
     locations: List[LocationData]
 
 class FarmLocationInput(BaseModel):
+    fileName: str
     latitude: str
     longitude: str
     farmId: str  # Mandatory farm _id
@@ -225,7 +226,7 @@ def get_farm_data():
         return {"error": f"Database server connection error: {str(e)}"}
 
 # Helper function to save single plant data to MongoDB
-def save_plant_to_farm(latitude: str, longitude: str, farm_id: str, crop_type: str = "mango"):
+def save_plant_to_farm(fileName: str, latitude: str, longitude: str, farm_id: str, crop_type: str = "mango"):
     """Save single plant to existing farm after checking for duplicates"""
     client = None
     try:
@@ -263,6 +264,7 @@ def save_plant_to_farm(latitude: str, longitude: str, farm_id: str, crop_type: s
         
         # No duplicate found, add new plant
         new_plant = {
+            "fileName": fileName,
             "cropType": crop_type,
             "latitude": latitude,
             "longitude": longitude
@@ -443,6 +445,7 @@ async def save_farm_data(location: FarmLocationInput):
         except Exception as e:
             logger.error(f"Invalid farmId {location.farmId}: {str(e)}")
             return FarmLocationResponse(
+                fileName=location.fileName,
                 latitude=location.latitude,
                 longitude=location.longitude,
                 cropType=location.cropType or "mango",
@@ -454,6 +457,7 @@ async def save_farm_data(location: FarmLocationInput):
         
         # Save to database
         save_result = save_plant_to_farm(
+            location.fileName,
             location.latitude, 
             location.longitude, 
             location.farmId,
