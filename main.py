@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -8,10 +8,12 @@ from datetime import datetime
 import logging
 from pymongo import MongoClient
 import os
+import shutil
 from dotenv import load_dotenv
 from bson import ObjectId
 import cloudinary
 import cloudinary.utils
+import cloudinary.uploader
 import time
 import hashlib
 
@@ -115,6 +117,19 @@ class ImageMetadata(BaseModel):
     predictions: List[Dict[str, Any]]
     location: Optional[Dict[str, float]] = None
     uploadedAt: str
+
+# class ImageUploadResponse(BaseModel):
+#     success: bool
+#     message: str
+#     cloudinary_url: Optional[str] = None
+#     public_id: Optional[str] = None
+#     secure_url: Optional[str] = None
+
+class ImageUploadResponse(BaseModel):
+    success: bool
+    message: str
+    file_path: Optional[str] = None
+    filename: Optional[str] = None
 
 # Global variables
 processed_locations = []
@@ -567,8 +582,95 @@ async def save_image_metadata(metadata: ImageMetadata):
             detail=f"Failed to save metadata: {str(e)}"
         )
 
+# @app.post("/save-image", response_model=ImageUploadResponse)
+# async def save_image(file: UploadFile = File(...)):
+#     """
+#     Save image directly to Cloudinary from frontend upload.
+#     """
+#     try:
+#         # Validate file type
+#         if not file.content_type.startswith('image/'):
+#             raise HTTPException(status_code=400, detail="File must be an image")
+        
+#         # Read file content
+#         file_content = await file.read()
+        
+#         # Upload to Cloudinary
+#         upload_result = cloudinary.uploader.upload(
+#             file_content,
+#             folder="mango-trees",
+#             resource_type="image",
+#             public_id=f"img_{int(time.time())}_{file.filename}",
+#             overwrite=True
+#         )
+        
+#         # Save metadata to your store
+#         metadata_record = {
+#             "id": str(uuid.uuid4()),
+#             "cloudinary_url": upload_result.get("url"),
+#             "secure_url": upload_result.get("secure_url"),
+#             "public_id": upload_result.get("public_id"),
+#             "original_name": file.filename,
+#             "uploaded_at": datetime.now().isoformat(),
+#             "file_size": len(file_content),
+#             "format": upload_result.get("format")
+#         }
+        
+#         image_metadata_store.append(metadata_record)
+        
+#         logger.info(f"Successfully saved image: {file.filename}")
+        
+#         return ImageUploadResponse(
+#             success=True,
+#             message="Image saved successfully",
+#             cloudinary_url=upload_result.get("url"),
+#             public_id=upload_result.get("public_id"),
+#             secure_url=upload_result.get("secure_url")
+#         )
+        
+#     except Exception as e:
+#         logger.error(f"Error saving image: {str(e)}")
+#         raise HTTPException(status_code=500, detail=f"Failed to save image: {str(e)}")
 
-
+@app.post("/save-image", response_model=ImageUploadResponse)
+async def save_image(file: UploadFile):
+    """
+    Save image to backend filesystem.
+    """
+    try:
+        # Check if file is provided
+        if not file:
+            raise HTTPException(status_code=400, detail="No file provided")
+            
+        # Validate file type
+        if not file.content_type or not file.content_type.startswith('image/'):
+            raise HTTPException(status_code=400, detail="File must be an image")
+        
+        # Create uploads directory if it doesn't exist
+        upload_dir = "uploads"
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        # Generate unique filename
+        timestamp = int(time.time())
+        filename = f"{timestamp}_{file.filename}"
+        file_path = os.path.join(upload_dir, filename)
+        
+        # Save file to backend
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        logger.info(f"Successfully saved image: {filename}")
+        
+        return ImageUploadResponse(
+            success=True,
+            message="Image saved successfully to backend",
+            file_path=file_path,
+            filename=filename
+        )
+        
+    except Exception as e:
+        logger.error(f"Error saving image: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save image: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
