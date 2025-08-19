@@ -502,27 +502,19 @@ async def dashboard():
     else:
         return("could not get farm data")
 
-#CLOUDINARY SIGNATURE
-@app.post("/get-cloudinary-signature", response_model=SignatureResponse)
+# Endpoint to get Cloudinary upload signature
+@app.post("/cloudinary-signature", response_model=SignatureResponse)
 async def get_cloudinary_signature(request: SignatureRequest):
-    """
-    Generate a signature for secure direct upload to Cloudinary.
-    This allows frontend to upload directly to Cloudinary securely.
-    """
     try:
-        # Generate timestamp (current time in seconds)
         timestamp = int(time.time())
         
-        # Parameters to sign
+        # REMOVE upload_preset from params_to_sign
         params_to_sign = {
             "timestamp": timestamp,
-            "folder": request.folder,
-            "upload_preset": "your_upload_preset"
-
+            "folder": request.folder
+            # REMOVE: "upload_preset": "your_upload_preset"
         }
         
-        
-        # Generate the signature using Cloudinary's utility
         signature = cloudinary.utils.api_sign_request(
             params_to_sign,
             os.getenv("CLOUDINARY_API_SECRET")
