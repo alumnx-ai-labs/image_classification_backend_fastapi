@@ -1,10 +1,5 @@
 # Mango Tree Location API
 
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
-![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=for-the-badge&logo=python&logoColor=white)
-![MongoDB](https://img.shields.io/badge/MongoDB-47A248?style=for-the-badge&logo=mongodb&logoColor=white)
-![Cloudinary](https://img.shields.io/badge/Cloudinary-3448C5?style=for-the-badge&logo=cloudinary&logoColor=white)
-
 A FastAPI-based backend for classifying and managing mango tree images and their geographical locations. This API allows for image uploads, metadata storage, and proximity analysis to identify duplicate entries.
 
 This project is designed to be beginner-friendly and easy to deploy. For more detailed guides, please see our [documentation](#documentation).
